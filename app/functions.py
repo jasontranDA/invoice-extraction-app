@@ -1,3 +1,9 @@
+
+import sys
+import pysqlite3  # Import pysqlite3 to fix SQLite version issues
+
+# Force Python to use pysqlite3 instead of the outdated SQLite
+sys.modules["sqlite3"] = pysqlite3
 # Import Langchain modules
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
