@@ -96,7 +96,7 @@ def get_embedding_function():
     Returns:
         OpenAIEmbeddings: An OpenAIEmbeddings object, which can be used to create vector embeddings from text.
     """
-    embeddings = OllamaEmbeddings(model="nomic-embed-text",show_progress=False)
+    embeddings = OllamaEmbeddings(model="nomic-embed-text")
 
     return embeddings
 
