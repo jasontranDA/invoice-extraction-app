@@ -1,252 +1,206 @@
+from __future__ import annotations
 
-import sys
-import pysqlite3  # Import pysqlite3 to fix SQLite version issues
-
-# Force Python to use pysqlite3 instead of the outdated SQLite
-sys.modules["sqlite3"] = pysqlite3
-# Import Langchain modules
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel, Field  # ✅ FIXED HERE
-from langchain_ollama import ChatOllama
-from langchain_ollama import OllamaEmbeddings
-
-
-# Other modules and packages
-import streamlit as st  
-import pandas as pd
-
-import uuid
 import re
-import os
+import shutil
+import sys
 import tempfile
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
 
+import pandas as pd
+import pysqlite3
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from pydantic import BaseModel, Field
 
-def clean_filename(filename):
-    """
-    Remove "(number)" pattern from a filename 
-    (because this could cause error when used as collection name when creating Chroma database).
+# Force Python to use pysqlite3 instead of the system sqlite module for Chroma.
+sys.modules["sqlite3"] = pysqlite3
 
-    Parameters:
-        filename (str): The filename to clean
+DEFAULT_QUERY = "Extract the key details from this business invoice."
+DEFAULT_CHAT_MODEL = "llama3.2"
+DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
 
-    Returns:
-        str: The cleaned filename
-    """
-    # Regular expression to find "(number)" pattern
-    new_filename = re.sub(r'\s\(\d+\)', '', filename)
-    
-    return new_filename
-
-
-def get_pdf_text(uploaded_file): 
-    """
-    Load a PDF document from an uploaded file and return it as a list of documents
-
-    Parameters:
-        uploaded_file (file-like object): The uploaded PDF file to load
-
-    Returns:
-        list: A list of documents created from the uploaded PDF file
-    """
-    try:
-        # Read file content
-        input_file = uploaded_file.read()
-
-        # Create a temporary file (PyPDFLoader requires a file path to read the PDF,
-        # it can't work directly with file-like objects or byte streams that we get from Streamlit's uploaded_file)
-        temp_file = tempfile.NamedTemporaryFile(delete=False)
-        temp_file.write(input_file)
-        temp_file.close()
-
-        # load PDF document
-        loader = PyPDFLoader(temp_file.name)
-        documents = loader.load()
-
-        return documents
-    
-    finally:
-        # Ensure the temporary file is deleted when we're done with it
-        os.unlink(temp_file.name)
-
-
-def split_document(documents, chunk_size, chunk_overlap):    
-    """
-    Function to split generic text into smaller chunks.
-    chunk_size: The desired maximum size of each chunk (default: 400)
-    chunk_overlap: The number of characters to overlap between consecutive chunks (default: 20).
-
-    Returns:
-        list: A list of smaller text chunks created from the generic text
-    """
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size,
-                                          chunk_overlap=chunk_overlap,
-                                          length_function=len,
-                                          separators=["\n\n", "\n", " "])
-    
-    return text_splitter.split_documents(documents)
-
-
-def get_embedding_function():
-    """
-    Return an OpenAIEmbeddings object, which is used to create vector embeddings from text.
-    The embeddings model used is "text-embedding-ada-002" and the OpenAI API key is provided
-    as an argument to the function.
-
-    Parameters:
-        api_key (str): The OpenAI API key to use when calling the OpenAI Embeddings API.
-
-    Returns:
-        OpenAIEmbeddings: An OpenAIEmbeddings object, which can be used to create vector embeddings from text.
-    """
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
-
-    return embeddings
-
-
-def create_vectorstore(chunks, embedding_function, file_name, vector_store_path="db"):
-
-    """
-    Create a vector store from a list of text chunks.
-
-    :param chunks: A list of generic text chunks
-    :param embedding_function: A function that takes a string and returns a vector
-    :param file_name: The name of the file to associate with the vector store
-    :param vector_store_path: The directory to store the vector store
-
-    :return: A Chroma vector store object
-    """
-
-    # Create a list of unique ids for each document based on the content
-    ids = [str(uuid.uuid5(uuid.NAMESPACE_DNS, doc.page_content)) for doc in chunks]
-    
-    # Ensure that only unique docs with unique ids are kept
-    unique_ids = set()
-    unique_chunks = []
-    
-    unique_chunks = [] 
-    for chunk, id in zip(chunks, ids):     
-        if id not in unique_ids:       
-            unique_ids.add(id)
-            unique_chunks.append(chunk)        
-
-    # Create a new Chroma database from the documents
-    vectorstore = Chroma.from_documents(documents=unique_chunks, 
-                                        collection_name=clean_filename(file_name),
-                                        embedding=embedding_function, 
-                                        ids=list(unique_ids), 
-                                        persist_directory = vector_store_path)
-
-    # The database should save automatically after we create it
-    # but we can also force it to save using the persist() method
-    vectorstore.persist()
-    
-    return vectorstore
-
-
-def create_vectorstore_from_texts(documents, file_name):
-    """
-    Create a vector store from a list of texts.
-
-    :param documents: A list of generic text documents
-    :param file_name: The name of the file to associate with the vector store
-
-    :return: A Chroma vector store object
-    """
-
-    # Split the documents into chunks
-    chunks = split_document(documents, chunk_size=1000, chunk_overlap=200)
-    
-    # Step 3 define embedding function
-    embedding_function = get_embedding_function()
-
-    # Step 4 create a vector store  
-    vectorstore = create_vectorstore(chunks, embedding_function, file_name)
-    
-    return vectorstore
-
-
-# Prompt template
 PROMPT_TEMPLATE = """
-You are an assistant for question-answering tasks.
-Use the following pieces of retrieved context to answer
-the question. If you don't know the answer, say that you
-don't know. DON'T MAKE UP ANYTHING.
+You extract structured data from invoices.
+Use only the retrieved invoice context. If a value is missing, return "Not found".
+Do not invent details.
 
+Retrieved context:
 {context}
 
----
-
-Answer the question based on the above context: {question}
+Question: {question}
 """
 
+
 class ExtractedInfo(BaseModel):
-    """Extracted information about the research article"""
-    invoice_items: str =  Field(description="Extract invoice items")
-    invoice_date: str =  Field(description="Extract invoice date")
-    business_name: str =  Field(description="Extract business name")
-    total_amount: str =  Field(description="Extract total amount")
+    """Structured invoice information returned by the LLM."""
+
+    invoice_items: str = Field(description="Line items or services listed on the invoice")
+    invoice_date: str = Field(description="Invoice issue date")
+    business_name: str = Field(description="Vendor or business name on the invoice")
+    total_amount: str = Field(description="Invoice total amount due")
 
 
-def format_docs(docs):
-    """
-    Format a list of Document objects into a single string.
+@dataclass(frozen=True)
+class AppConfig:
+    chat_model: str = DEFAULT_CHAT_MODEL
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    chunk_size: int = 1200
+    chunk_overlap: int = 150
+    retrieval_k: int = 4
 
-    :param docs: A list of Document objects
-    :return: A string containing the text of all the documents joined by two newlines
-    """
+
+class InvoiceProcessingError(RuntimeError):
+    """Raised when a PDF cannot be processed into invoice data."""
+
+
+
+def clean_filename(filename: str) -> str:
+    """Normalize a filename into a valid Chroma collection name."""
+    stem = Path(filename).stem
+    cleaned = re.sub(r"\s*\(\d+\)", "", stem)
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "-", cleaned).strip("-")
+    return (cleaned or "invoice")[:63]
+
+
+
+def get_pdf_documents(uploaded_file) -> list[Document]:
+    """Load an uploaded PDF into LangChain documents."""
+    suffix = Path(uploaded_file.name).suffix or ".pdf"
+    temp_path: Path | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(uploaded_file.getvalue())
+            temp_path = Path(temp_file.name)
+
+        loader = PyPDFLoader(str(temp_path))
+        return loader.load()
+    except Exception as exc:  # noqa: BLE001
+        raise InvoiceProcessingError(f"Unable to read PDF '{uploaded_file.name}'.") from exc
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+
+
+
+def split_documents(documents: Sequence[Document], chunk_size: int, chunk_overlap: int) -> list[Document]:
+    """Split documents into chunks sized for embedding and retrieval."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        length_function=len,
+        separators=["\n\n", "\n", " ", ""],
+    )
+    return splitter.split_documents(list(documents))
+
+
+
+def get_embedding_function(model_name: str) -> OllamaEmbeddings:
+    """Create the embedding function used for Chroma."""
+    return OllamaEmbeddings(model=model_name)
+
+
+
+def deduplicate_chunks(chunks: Iterable[Document]) -> tuple[list[Document], list[str]]:
+    """Deduplicate chunks while preserving order and aligned IDs."""
+    unique_chunks: list[Document] = []
+    unique_ids: list[str] = []
+    seen_ids: set[str] = set()
+
+    for chunk in chunks:
+        chunk_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk.page_content))
+        if chunk_id in seen_ids:
+            continue
+        seen_ids.add(chunk_id)
+        unique_chunks.append(chunk)
+        unique_ids.append(chunk_id)
+
+    return unique_chunks, unique_ids
+
+
+
+def create_vectorstore(chunks: Sequence[Document], embedding_model: str, file_name: str) -> tuple[Chroma, str]:
+    """Build a temporary Chroma vector store for a single invoice."""
+    unique_chunks, unique_ids = deduplicate_chunks(chunks)
+    persist_directory = tempfile.mkdtemp(prefix="invoice-chroma-")
+
+    vectorstore = Chroma.from_documents(
+        documents=unique_chunks,
+        ids=unique_ids,
+        collection_name=clean_filename(file_name),
+        embedding=get_embedding_function(embedding_model),
+        persist_directory=persist_directory,
+    )
+    vectorstore.persist()
+    return vectorstore, persist_directory
+
+
+
+def format_docs(docs: Sequence[Document]) -> str:
+    """Render retrieved documents into prompt context."""
     return "\n\n".join(doc.page_content for doc in docs)
 
 
-def query_document(vectorstore, query="Extract relevant details from this business invoice."):
 
-    """
-    Query a vector store with a question and return a structured response.
-
-    :param vectorstore: A Chroma vector store object
-    :param query: The question to ask the vector store
-    :param api_key: The OpenAI API key to use when calling the OpenAI Embeddings API
-
-    :return: A pandas DataFrame with three rows: 'answer', 'source', and 'reasoning'
-    """
-    llm = ChatOllama(model='llama3.2', temperature=0)
-    retriever = vectorstore.as_retriever(search_type="similarity")
-
+def query_document(vectorstore: Chroma, query: str, config: AppConfig) -> pd.DataFrame:
+    """Query the vector store and return a single-row invoice dataframe."""
+    llm = ChatOllama(model=config.chat_model, temperature=0)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": config.retrieval_k})
     prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
 
     rag_chain = (
-            {"context": retriever | format_docs, "question": RunnablePassthrough()}
-            | prompt_template
-            | llm.with_structured_output(ExtractedInfo)
-        )
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | prompt_template
+        | llm.with_structured_output(ExtractedInfo)
+    )
 
-    structured_response = rag_chain.invoke(query)
+    try:
+        response = rag_chain.invoke(query)
+    except Exception as exc:  # noqa: BLE001
+        raise InvoiceProcessingError(
+            "The Ollama models could not be reached. Confirm Ollama is running and the required models are installed."
+        ) from exc
 
-    df = pd.DataFrame([{
-        "Invoice Items": structured_response.invoice_items,
-        "Invoice Date": structured_response.invoice_date,
-        "Business Name": structured_response.business_name,
-        "Total Amount": structured_response.total_amount,
-    }])
-    
-    return df
+    return pd.DataFrame(
+        [
+            {
+                "Invoice Items": response.invoice_items,
+                "Invoice Date": response.invoice_date,
+                "Business Name": response.business_name,
+                "Total Amount": response.total_amount,
+            }
+        ]
+    )
 
 
-def process_multiple_pdfs(pdf_files, query):
-    results = []
 
-    # Loop through all uploaded PDF files
+def process_multiple_pdfs(pdf_files, query: str = DEFAULT_QUERY, config: AppConfig | None = None) -> pd.DataFrame:
+    """Extract invoice details from multiple uploaded PDF files."""
+    active_config = config or AppConfig()
+    results: list[pd.DataFrame] = []
+
     for pdf_file in pdf_files:
-        file_name = pdf_file.name
-        documents = get_pdf_text(pdf_file)
-        vectorstore = create_vectorstore_from_texts(documents, file_name)
-        df = query_document(vectorstore, query=query)
-        df.insert(0, 'file_name', file_name)
-        results.append(df)
+        documents = get_pdf_documents(pdf_file)
+        chunks = split_documents(documents, active_config.chunk_size, active_config.chunk_overlap)
+        vectorstore, persist_directory = create_vectorstore(chunks, active_config.embedding_model, pdf_file.name)
 
-    final_df = pd.concat(results, ignore_index=True)
+        try:
+            result = query_document(vectorstore, query=query, config=active_config)
+        finally:
+            shutil.rmtree(persist_directory, ignore_errors=True)
 
-    return final_df
+        result.insert(0, "File Name", pdf_file.name)
+        results.append(result)
+
+    if not results:
+        return pd.DataFrame(columns=["File Name", "Invoice Items", "Invoice Date", "Business Name", "Total Amount"])
+
+    return pd.concat(results, ignore_index=True)

@@ -3,6 +3,7 @@ streamlit
 pandas
 langchain
 langchain-community
+langchain-text-splitters
 langchain_ollama
 chromadb
 pypdf
